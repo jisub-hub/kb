@@ -1,0 +1,179 @@
+#!/usr/bin/env python3
+"""
+kb — Knowledge Base CLI
+사용법: ./kb "질문"
+예시:  ./kb "RAG 청킹 전략 뭐가 좋아?"
+"""
+
+import sys
+import subprocess
+from pathlib import Path
+
+KB_DIR = Path(__file__).parent
+TOP_K = 4
+MAX_FILE_CHARS = 4000
+
+# 한국어 조사 목록 (긴 것부터 — 순서 중요)
+PARTICLES = [
+    '에서', '으로', '이란', '이라', '에게', '부터', '까지',
+    '은', '는', '이', '가', '을', '를', '의', '에', '로', '와', '과', '도', '만'
+]
+
+def strip_particle(word):
+    for p in PARTICLES:
+        if word.endswith(p) and len(word) > len(p) + 1:
+            return word[:-len(p)]
+    return word
+
+def extract_keywords(query):
+    return [strip_particle(w) for w in query.split() if len(w) > 1]
+
+def parse_tags(text):
+    """frontmatter에서 태그 추출"""
+    if not text.startswith('---'):
+        return []
+    end = text.find('---', 3)
+    if end < 0:
+        return []
+    tags = []
+    for line in text[3:end].splitlines():
+        line = line.strip()
+        if line.startswith('- '):
+            tags.append(line[2:].strip().lower())
+    return tags
+
+def score_file(path, keywords):
+    try:
+        text = path.read_text(encoding='utf-8')
+    except Exception:
+        return 0
+
+    text_lower = text.lower()
+    tags = parse_tags(text)
+    stem_lower = path.stem.lower()
+    score = 0
+
+    for kw in keywords:
+        kw = kw.lower()
+        if not kw:
+            continue
+        for tag in tags:
+            if kw in tag:
+                score += 10          # 태그 매칭 ×10
+        if kw in stem_lower:
+            score += 5               # 파일명 매칭 ×5
+        score += text_lower.count(kw)  # 본문 빈도 ×1
+
+    return score
+
+def search(query):
+    kws = extract_keywords(query)
+    if not kws:
+        return []
+
+    results = []
+    for path in KB_DIR.rglob("*.md"):
+        if path.name.startswith('_'):  # _index.md 제외
+            continue
+        s = score_file(path, kws)
+        if s > 0:
+            results.append((path, s))
+
+    results.sort(key=lambda x: x[1], reverse=True)
+    return results[:TOP_K]
+
+def build_context(results):
+    parts = []
+
+    # 최상위 히트 폴더의 _index.md를 구조 컨텍스트로 추가
+    if results:
+        idx_path = results[0][0].parent / "_index.md"
+        if idx_path.exists():
+            try:
+                content = idx_path.read_text(encoding='utf-8')[:2000]
+                parts.append(f"[구조 인덱스: {idx_path.relative_to(KB_DIR)}]\n{content}")
+            except Exception:
+                pass
+
+    for path, _ in results:
+        try:
+            content = path.read_text(encoding='utf-8')[:MAX_FILE_CHARS]
+            parts.append(f"[{path.relative_to(KB_DIR)}]\n{content}")
+        except Exception:
+            continue
+
+    return "\n\n---\n\n".join(parts)
+
+def show_index():
+    """각 폴더의 _index.md에서 주제 목록 출력"""
+    print("=" * 50)
+    print("  KB 지식베이스 — 주제 목록")
+    print("=" * 50)
+
+    for index_path in sorted(KB_DIR.glob("*/_index.md")):
+        folder = index_path.parent.name
+        try:
+            text = index_path.read_text(encoding='utf-8')
+        except Exception:
+            continue
+
+        # H1 제목 추출
+        title = folder
+        for line in text.splitlines():
+            if line.startswith('# '):
+                title = line[2:].strip()
+                break
+
+        print(f"\n📁 {folder}/  ({title})")
+
+        # ## 섹션 헤더만 추출
+        for line in text.splitlines():
+            if line.startswith('## ') and not line.startswith('### '):
+                section = line[3:].strip()
+                # 이모지·특수문자 포함된 구분선 섹션 제외
+                if section and not section.startswith('---') and not section.startswith('🧭') and not section.startswith('🔑'):
+                    print(f"   • {section}")
+
+    print()
+    print("사용법: ./kb \"질문\"")
+    print("예시:  ./kb \"RAG 청킹 전략 뭐가 좋아?\"")
+    print()
+
+def main():
+    if len(sys.argv) < 2:
+        show_index()
+        sys.exit(0)
+
+    query = " ".join(sys.argv[1:])
+
+    print("🔍 검색 중...", flush=True)
+    results = search(query)
+
+    if not results:
+        print("관련 문서를 찾지 못했습니다.")
+        sys.exit(1)
+
+    print("📄 참조:", ", ".join(str(p.relative_to(KB_DIR)) for p, _ in results))
+    print()
+
+    context = build_context(results)
+    prompt = f"""아래는 지식베이스에서 검색된 관련 문서입니다.
+
+{context}
+
+---
+질문: {query}
+
+위 문서를 근거로 답변하세요. 답변 마지막에 "출처: 파일명" 형식으로 참고한 파일을 명시하세요."""
+
+    try:
+        subprocess.run(["claude", "-p", prompt], check=True)
+    except FileNotFoundError:
+        print("오류: claude 명령어를 찾을 수 없습니다.")
+        print("Claude Code가 설치되어 있는지 확인해주세요: https://claude.ai/code")
+        sys.exit(1)
+    except KeyboardInterrupt:
+        print("\n중단됨.")
+
+if __name__ == "__main__":
+    main()
